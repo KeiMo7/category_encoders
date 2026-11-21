@@ -1,3 +1,16 @@
+Unreleased
+==========
+
+* Feature: opt-in category coverage reporting via the new encoder parameters
+  ``coverage_report`` and ``coverage_threshold``. When enabled, every
+  ``transform`` collects per-column statistics (category coverage with the
+  fit ∪ batch distinct-value denominator, unseen-row ratio, ``min_group_size``
+  lumping details) and warns (``category_encoders.coverage.CoverageWarning``)
+  when a batch contains categories never seen at fit time, including the
+  all-new-column case. ``encoder.coverage_summary(label=...)`` builds the
+  per-column summary table on demand. Default ``coverage_report=False`` keeps
+  the previous behaviour exactly.
+
 v.2.11.2
 ========
 

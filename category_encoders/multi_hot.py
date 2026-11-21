@@ -104,6 +104,8 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         handle_missing: str = 'value',
         delimiter: str = '|',
         use_cat_names: bool = False,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
     ):
         super().__init__(
             verbose=verbose,
@@ -112,6 +114,8 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+            coverage_report=coverage_report,
+            coverage_threshold=coverage_threshold,
         )
         self.delimiter = delimiter
         self.use_cat_names = use_cat_names

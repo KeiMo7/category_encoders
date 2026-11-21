@@ -105,6 +105,8 @@ class LeaveOneOutEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
         combine_min_nan_groups: bool | str | None = None,
         composite_cols=None,
         keep_components=False,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
     ):
         super().__init__(
             verbose=verbose,
@@ -118,6 +120,8 @@ class LeaveOneOutEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
             combine_min_nan_groups=combine_min_nan_groups,
             composite_cols=composite_cols,
             keep_components=keep_components,
+            coverage_report=coverage_report,
+            coverage_threshold=coverage_threshold,
         )
         self.mapping = None
         self._mean = None

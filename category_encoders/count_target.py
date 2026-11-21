@@ -124,6 +124,8 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         handle_unknown: str = 'value',
         min_samples_leaf: int = 20,
         smoothing: float = 10,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
     ) -> None:
         super().__init__(
             verbose=verbose,
@@ -132,6 +134,8 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+            coverage_report=coverage_report,
+            coverage_threshold=coverage_threshold,
         )
         self.min_samples_leaf = min_samples_leaf
         self.smoothing = smoothing

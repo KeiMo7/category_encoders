@@ -120,6 +120,7 @@ Contents:
    conventions_vs_sklearn
    count
    count_target
+   coverage
    glmm
    gray
    hashing

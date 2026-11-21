@@ -38,6 +38,8 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         combine_min_nan_groups=None,
         min_group_name=None,
         normalize=False,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
     ):
         """Count encoding for categorical features.
 
@@ -131,6 +133,8 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+            coverage_report=coverage_report,
+            coverage_threshold=coverage_threshold,
         )
         self.mapping = None
         self.normalize = normalize
@@ -233,6 +237,13 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             )
             if lumping_map:
                 self._min_group_categories[col] = lumping_map
+                if getattr(self, 'coverage_report', False):
+                    lumped = mapper[mapper.index.isin(lumping_map)].sum()
+                    # with normalize=True the mapper holds fractions, else counts
+                    fraction = (
+                        float(lumped) if self._normalize[col] else float(lumped) / X.shape[0]
+                    )
+                    self._note_coverage_lumping(col, lumping_map, fraction)
 
     def _check_set_create_attrs(self):
         """Check attributes setting that don't play nicely `self.cols`."""

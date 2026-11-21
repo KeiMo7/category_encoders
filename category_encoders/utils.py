@@ -19,6 +19,8 @@ from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils import Tags
 
+import category_encoders.coverage as coverage
+
 __author__ = 'willmcginnis'
 
 X_type = np.ndarray | pd.DataFrame | list | np.generic | csr_matrix
@@ -436,11 +438,9 @@ class EncoderTags(Tags):
     @classmethod
     def from_sk_tags(cls, tags: Tags) -> EncoderTags:
         """Initialize EncoderTags from given sklearn Tags."""
-        as_dict = {
-            field.name: getattr(tags, field.name)
-            for field in fields(tags)
-        }
+        as_dict = {field.name: getattr(tags, field.name) for field in fields(tags)}
         return cls(**as_dict)
+
 
 def evaluate_handle_callable(
     fn: Callable,
@@ -574,6 +574,8 @@ class BaseEncoder(BaseEstimator):
     min_group_lumping_: dict[str, dict]
     composite_cols: list[tuple[str, ...]] | None
     keep_components: bool
+    coverage_report: bool
+    coverage_threshold: float
     # fitted state: synthetic composite column name -> tuple of member columns
     composite_members_: dict[str, tuple[str, ...]] = {}
 
@@ -606,6 +608,8 @@ class BaseEncoder(BaseEstimator):
         combine_min_nan_groups: bool | str | None = None,
         composite_cols: list[tuple[str, ...]] | None = None,
         keep_components: bool = False,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
         **kwargs,
     ):
         """Initialize the encoder.
@@ -663,6 +667,17 @@ class BaseEncoder(BaseEstimator):
             if True, the member columns of every composite group are also encoded
             individually and kept in the output next to the composite columns.
             Default False.
+        coverage_report: bool
+            if True, collect per-column category coverage statistics at fit and at
+            every transform, and warn (CoverageWarning) when a transformed batch
+            contains categories never seen at fit time. The statistics of the most
+            recent batch are stored in `coverage_report_`; call `coverage_summary()`
+            for the per-column summary table. Default False, which keeps the
+            previous behaviour exactly (no statistics are collected).
+        coverage_threshold: float
+            fraction of rows with unseen categories above which a column triggers a
+            CoverageWarning at transform time (and is flagged 'low_coverage' in the
+            summary). Must be in [0, 1]. Default 0.0, i.e. any unseen row warns.
         kwargs: dict.
             additional encoder specific parameters like regularisation.
         """
@@ -684,6 +699,8 @@ class BaseEncoder(BaseEstimator):
         self.combine_min_nan_groups = combine_min_nan_groups
         self.composite_cols = composite_cols
         self.keep_components = keep_components
+        self.coverage_report = coverage_report
+        self.coverage_threshold = coverage_threshold
         self._dim = None
 
     def fit(self, X: X_type, y: y_type | None = None, **kwargs):
@@ -743,12 +760,24 @@ class BaseEncoder(BaseEstimator):
             if X[self.cols].isna().any().any():
                 raise ValueError('Columns to be encoded cannot contain null')
 
+        if getattr(self, 'coverage_report', False):
+            if len(X) == 0:
+                raise ValueError('coverage_report=True requires non-empty fit data, got 0 rows.')
+            # reset per-fit coverage state; _fit_min_group_lumping and
+            # CountEncoder.combine_min_categories fill coverage_lumping_
+            self.coverage_lumping_ = {}
+
         self.min_group_lumping_ = self._fit_min_group_lumping(X)
         if self.min_group_lumping_:
             # lump the training data itself so `_fit` sees the merged labels;
             # copy first because `X` may still be the caller's frame
             X = X.copy(deep=True)
             self._apply_min_group_lumping(X)
+
+        if getattr(self, 'coverage_report', False):
+            # record the categories the encoder will know, in the same (post-lumping)
+            # label space the transform-time statistics are collected in
+            self._fit_coverage(X)
 
         self._fit(X, y, **kwargs)
 
@@ -769,9 +798,7 @@ class BaseEncoder(BaseEstimator):
         # drop all output columns with 0 variance.
         if self.drop_invariant:
             generated_cols = get_generated_cols(X, X_transformed, self.cols)
-            self.invariant_cols = [
-                x for x in generated_cols if X_transformed[x].nunique() <= 1
-            ]
+            self.invariant_cols = [x for x in generated_cols if X_transformed[x].nunique() <= 1]
             self.feature_names_out_ = np.fromiter(
                 (x for x in self.feature_names_out_ if x not in self.invariant_cols),
                 dtype=self.feature_names_out_.dtype,
@@ -956,13 +983,126 @@ class BaseEncoder(BaseEstimator):
             )
             if lumping_map:
                 lumping[col] = lumping_map
+                if getattr(self, 'coverage_report', False):
+                    lumped_rows = group_sizes[group_sizes.index.isin(lumping_map)].sum()
+                    self._note_coverage_lumping(col, lumping_map, lumped_rows / len(X))
         return lumping
+
+    def _note_coverage_lumping(self, col: str, lumping_map: dict, lumped_fraction: float) -> None:
+        """Record min-group lumping statistics of one column for the coverage report."""
+        self.coverage_lumping_[col] = {
+            'n_lumped': len(lumping_map),
+            'lumped_row_fraction': float(lumped_fraction),
+            'lumped_name': next(iter(lumping_map.values())),
+        }
+
+    def _fit_coverage(self, X: pd.DataFrame) -> None:
+        """Record the per-column categories seen at fit time for coverage reporting."""
+        threshold = self.coverage_threshold
+        if not isinstance(threshold, NUMERIC_SCALARS) or not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError(f'coverage_threshold must be a number in [0, 1], got {threshold!r}.')
+        self.coverage_fit_categories_ = {}
+        self.coverage_fit_errors_ = {}
+        for col in self.cols:
+            try:
+                self.coverage_fit_categories_[col] = coverage.column_categories(X[col])
+            except Exception as exc:  # unhashable values etc.; degrade to a report error
+                self.coverage_fit_errors_[col] = str(exc)
+
+    def _collect_coverage(self, X: pd.DataFrame) -> None:
+        """Compute per-column coverage statistics for one transform batch.
+
+        Never breaks encoding: unexpected failures degrade to a CoverageWarning.
+        Empty input is a hard error (a report on no data would be meaningless).
+        """
+        if len(X) == 0:
+            raise ValueError(
+                'coverage_report=True cannot evaluate coverage on empty data (0 rows).'
+            )
+        fit_categories = getattr(self, 'coverage_fit_categories_', None)
+        if fit_categories is None:
+            warnings.warn(
+                'coverage_report is enabled but no fit-time category statistics are '
+                'available (the encoder was fitted with coverage disabled or '
+                'unpickled from a version without coverage support). '
+                'Refit with coverage_report=True.',
+                coverage.CoverageWarning,
+                stacklevel=3,
+            )
+            return
+        try:
+            report = coverage.build_report(
+                self.cols,
+                X,
+                fit_categories,
+                getattr(self, 'coverage_fit_errors_', {}),
+                getattr(self, 'coverage_lumping_', {}),
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not break encoding
+            warnings.warn(
+                f'coverage report generation failed: {exc}',
+                coverage.CoverageWarning,
+                stacklevel=3,
+            )
+            return
+        self.coverage_report_ = report
+        report.warn(self.coverage_threshold)
+
+    def coverage_summary(self, cols: list | None = None, label: str | None = None) -> pd.DataFrame:
+        """Per-column category coverage summary of the most recent transform batch.
+
+        Requires `coverage_report=True`. After `fit` the summary describes the
+        training data itself; every `transform` replaces it with the statistics
+        of that batch. The table is built on demand, so on wide frames you only
+        pay for it (and can restrict it to a subset of `cols`) when you ask.
+
+        Parameters
+        ----------
+        cols: list, optional
+            subset of columns to include; None includes all encoded columns.
+        label: str, optional
+            dataset label (e.g. 'train' / 'validation') added as a 'dataset'
+            column, so summaries of successive transforms can be concatenated
+            and compared with identical metric definitions.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per encoded column: n_fit_categories, n_new_categories,
+            n_categories (distinct values across fit and the batch; the coverage
+            denominator), coverage (n_fit_categories / n_categories),
+            unseen_rows, n_rows, unseen_ratio (unseen_rows / n_rows), status
+            ('ok' / 'low_coverage' / 'all_new' / 'error'), lumped_categories
+            and lumped_row_fraction (min_group_size lumping), unseen_values.
+
+        """
+        if not getattr(self, 'coverage_report', False):
+            raise ValueError(
+                'coverage reporting is disabled; construct the encoder with '
+                'coverage_report=True to use coverage_summary().'
+            )
+        report = getattr(self, 'coverage_report_', None)
+        if report is None:
+            raise ValueError(
+                'no coverage statistics yet: run transform(...) (or fit(...)) '
+                'with coverage_report=True first.'
+            )
+        try:
+            return report.to_frame(cols=cols, label=label, threshold=self.coverage_threshold)
+        except Exception as exc:  # noqa: BLE001 - reporting must not break the workflow
+            warnings.warn(
+                f'coverage summary generation failed: {exc}',
+                coverage.CoverageWarning,
+                stacklevel=2,
+            )
+            return pd.DataFrame()
 
     def _apply_min_group_lumping(self, X: pd.DataFrame) -> None:
         """Fold the labels of `X` into their lumped groups, in place."""
         for col, lumping_map in self.min_group_lumping_.items():
             # normalize None to NaN so both spellings of missing share one group
             X[col] = X[col].fillna(np.nan).map(lumping_map).fillna(X[col])
+
     def _apply_composite_cols(self, X: pd.DataFrame) -> pd.DataFrame:
         """Validate composite_cols and append one synthetic '|'-joined column per group.
 
@@ -1184,6 +1324,8 @@ class SupervisedTransformerMixin(sklearn.base.TransformerMixin):
             return X if (self.return_df or override_return_df) else X.to_numpy()
 
         self._apply_min_group_lumping(X)
+        if getattr(self, 'coverage_report', False):
+            self._collect_coverage(X)
         X = self._transform(X, y)
         X = self._drop_composite_members(X)
 
@@ -1198,7 +1340,7 @@ class SupervisedTransformerMixin(sklearn.base.TransformerMixin):
         This also uses the target for transforming, not only for training.
         """
         if y is None:
-            raise TypeError('fit_transform() missing argument: ' 'y' '')
+            raise TypeError('fit_transform() missing argument: y')
         return self.fit(X, y, **fit_params).transform(X, y)
 
 
@@ -1239,6 +1381,8 @@ class UnsupervisedTransformerMixin(sklearn.base.TransformerMixin):
             return X if (self.return_df or override_return_df) else X.to_numpy()
 
         self._apply_min_group_lumping(X)
+        if getattr(self, 'coverage_report', False):
+            self._collect_coverage(X)
         X = self._transform(X)
         return self._drop_invariants(X, override_return_df)
 

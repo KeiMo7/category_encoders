@@ -140,6 +140,8 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
+        coverage_report: bool = False,
+        coverage_threshold: float = 0.0,
     ):
         super().__init__(
             verbose=verbose,
@@ -151,6 +153,8 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             min_group_size=min_group_size,
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
+            coverage_report=coverage_report,
+            coverage_threshold=coverage_threshold,
         )
 
         if max_process not in range(1, 128):
