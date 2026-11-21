@@ -38,6 +38,9 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         combine_min_nan_groups=None,
         min_group_name=None,
         normalize=False,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
     ):
         """Count encoding for categorical features.
 
@@ -131,6 +134,9 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.mapping = None
         self.normalize = normalize

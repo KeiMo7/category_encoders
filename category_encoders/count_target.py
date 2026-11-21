@@ -124,6 +124,9 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
         handle_unknown: str = 'value',
         min_samples_leaf: int = 20,
         smoothing: float = 10,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
     ) -> None:
         super().__init__(
             verbose=verbose,
@@ -132,6 +135,9 @@ class CountTargetEncoder(util.SupervisedTransformerMixin, util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.min_samples_leaf = min_samples_leaf
         self.smoothing = smoothing

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass, fields
 from enum import Enum, auto
+from pathlib import Path
 from typing import Callable, Hashable, Sequence
 
 import numpy as np
@@ -18,6 +20,32 @@ from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils import Tags
+
+# Mapping-integrity helpers live in a separate module and are re-exported here
+# so encoders and third-party code importing category_encoders.utils reach them
+# from one place. mapping_manifest imports nothing from this package, so there is
+# no import cycle.
+from category_encoders.mapping_manifest import (  # noqa: F401
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_DRIFT_THRESHOLD,
+    ColumnManifest,
+    MappingDriftWarning,
+    MappingManifest,
+    MappingManifestCorruptionError,
+    MappingManifestError,
+    MappingManifestNotFoundError,
+    MappingMismatchError,
+    build_manifest,
+    check_manifest,
+    describe_differences,
+    indexed_by_categories,
+    mapping_rows,
+    mapping_signature,
+)
+
+build_mapping_manifest = build_manifest
+build_mapping_rows = mapping_rows
+_indexed_by_categories = indexed_by_categories
 
 __author__ = 'willmcginnis'
 
@@ -751,6 +779,10 @@ class BaseEncoder(BaseEstimator):
             self._apply_min_group_lumping(X)
 
         self._fit(X, y, **kwargs)
+        # Opt-in: encoders that expose mapping_integrity build their manifest
+        # here. The default path takes no new attributes and is unchanged.
+        if getattr(self, 'mapping_integrity', False):
+            self._fit_mapping_manifest(X)
 
         # for finding invariant columns transform without y (as is done on the test set)
         self.feature_names_out_ = None  # Issue#437
@@ -778,6 +810,172 @@ class BaseEncoder(BaseEstimator):
             )
 
         return self
+
+    @staticmethod
+    def _indexed_by_categories(inner_rows, outer_rows) -> bool:
+        """True when the outer mapping is keyed by categories, not by codes.
+
+        Compares the outer mapping's index set with the inner ordinal table's
+        category set for every shared column.
+        """
+        return _indexed_by_categories(inner_rows, outer_rows)
+
+    def _init_mapping_integrity(
+        self,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = DEFAULT_DRIFT_THRESHOLD,
+    ) -> None:
+        """Initialize the opt-in mapping-integrity parameters.
+
+        Encoders that expose these as constructor parameters call this from
+        their ``__init__``; encoders that do not never set them, and the fit /
+        transform guards stay inert.
+        """
+        self.mapping_integrity = mapping_integrity
+        self.mapping_manifest = mapping_manifest
+        self.mapping_drift_threshold = mapping_drift_threshold
+
+    # -- mapping manifest (opt-in, see mapping_integrity) -------------------
+
+    def _fit_mapping_manifest(self, X: pd.DataFrame) -> None:
+        """Build ``mapping_manifest_`` for the mapping just fitted.
+
+        A no-op unless ``mapping_integrity`` is enabled, so the default encoder
+        path is unchanged. Encoders with no ``mapping`` attribute (for example
+        ``HashingEncoder``) are skipped. A manifest left over from a previous fit
+        is always discarded first, so a refit can never keep verifying against
+        an old table.
+        """
+        self.mapping_manifest_ = None
+        self._resolved_mapping_manifest = None
+        self._mapping_manifest_path = None
+        self._mapping_manifest_signature = None
+        self._manifest_verified_key = None
+        if not getattr(self, 'mapping_integrity', False):
+            return
+        rows = self._manifest_rows()
+        if rows is None:
+            return
+        counts = self._fit_manifest_counts(X, rows)
+        self.mapping_manifest_ = build_mapping_manifest(
+            rows,
+            encoder=type(self).__name__,
+            n_samples=len(X),
+            handle_unknown=self.handle_unknown,
+            handle_missing=self.handle_missing,
+            counts=counts,
+        )
+        self._mapping_manifest_signature = mapping_signature(rows)
+
+    def _manifest_rows(self) -> list[dict] | None:
+        """The category -> encoded-value table this encoder's manifest describes.
+
+        The inner ``ordinal_encoder`` holds the category -> code identity table
+        for every encoder that pre-fits an ordinal encoding. Most of those
+        encoders index their own ``mapping`` by those *codes*, so the category
+        table is the one to record. Count-style encoders index their ``mapping``
+        by the categories themselves and store the actual encoded value (a
+        count) there; for them the encoder's own table is the one to record.
+
+        ``None`` when the encoder has no table at all (``HashingEncoder``).
+        """
+        outer = getattr(self, 'mapping', None)
+        inner = getattr(self, 'ordinal_encoder', None)
+        inner_mapping = getattr(inner, 'mapping', None)
+        if outer is None:
+            return build_mapping_rows(inner_mapping) if inner_mapping is not None else None
+        if inner_mapping is None:
+            return build_mapping_rows(outer)
+        inner_rows = build_mapping_rows(inner_mapping)
+        outer_rows = build_mapping_rows(outer)
+        if _indexed_by_categories(inner_rows, outer_rows):
+            return outer_rows
+        return inner_rows
+
+    def _fit_manifest_counts(self, X: pd.DataFrame, rows: list[dict]) -> dict:
+        """Per-column training category counts, aligned by category value."""
+        counts = {}
+        for row in rows:
+            col = row['col']
+            if col in X.columns:
+                counts[col] = X[col].value_counts(dropna=False)
+        return counts
+
+    def _manifest_source_key(self) -> tuple:
+        """Fingerprint of where the expected manifest comes from.
+
+        Part of the verification cache key so that assigning a new
+        ``mapping_manifest`` (a path, another manifest object or a reference
+        encoder) invalidates a previously passing verdict.
+        """
+        source = getattr(self, 'mapping_manifest', None)
+        if source is None:
+            fitted = getattr(self, 'mapping_manifest_', None)
+            if fitted is None:
+                return ('none',)
+            return ('fitted', fitted.content_digest)
+        if isinstance(source, MappingManifest):
+            return ('manifest', source.content_digest)
+        if isinstance(source, (str, os.PathLike)) and not hasattr(source, 'mapping_manifest_'):
+            path = Path(source)
+            try:
+                stat = path.stat()
+                state = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                state = None
+            return ('path', str(path), state)
+        if hasattr(source, 'mapping_manifest_'):
+            return ('encoder', id(source))
+        return ('other', repr(source))
+
+    def _verify_mapping_manifest(self, X: pd.DataFrame | None = None) -> None:
+        """Verify the mapping in use against the expected manifest.
+
+        A no-op unless ``mapping_integrity`` is enabled. Raises
+        ``MappingManifestNotFoundError`` when no manifest can be found,
+        ``MappingManifestCorruptionError`` for a damaged manifest and
+        ``MappingMismatchError`` when the live mapping differs from the expected
+        one; emits ``MappingDriftWarning`` when the inference category set drifts
+        too far from the fitted one.
+
+        The verdict is cached per (mapping content, expected manifest source,
+        policies, threshold) so repeated transforms with a small, unchanged
+        mapping do not re-hash it. Any content or source change recomputes it, so
+        a mapping replaced after fit can never keep a passing verdict.
+        """
+        if not getattr(self, 'mapping_integrity', False):
+            return
+        rows = self._manifest_rows()
+        if rows is None:
+            return
+        source_key = self._manifest_source_key()
+        cache_key = (
+            mapping_signature(rows),
+            source_key,
+            repr(self.handle_unknown),
+            repr(self.handle_missing),
+            self.mapping_drift_threshold,
+        )
+        if cache_key == getattr(self, '_manifest_verified_key', None):
+            return
+        categories = {}
+        if X is not None:
+            # Drift is measured on the labels the encoder actually sees: apply
+            # the fitted min_group_size lumping so lumped-away labels are not
+            # reported as unknown categories.
+            lumping = getattr(self, 'min_group_lumping_', None) or {}
+            for row in rows:
+                col = row['col']
+                if col in X.columns:
+                    values = X[col]
+                    if col in lumping:
+                        values = values.fillna(np.nan).map(lumping[col]).fillna(values)
+                    # keep the Series: materializing every value as a Python
+                    # object would copy the whole column just for the statistics
+                    categories[col] = values
+        check_manifest(self, rows, categories=categories)
+        self._manifest_verified_key = cache_key
 
     def _check_fit_inputs(self, X: X_type, y: y_type) -> None:
         if self.__sklearn_tags__().target_tags.required:
@@ -963,6 +1161,7 @@ class BaseEncoder(BaseEstimator):
         for col, lumping_map in self.min_group_lumping_.items():
             # normalize None to NaN so both spellings of missing share one group
             X[col] = X[col].fillna(np.nan).map(lumping_map).fillna(X[col])
+
     def _apply_composite_cols(self, X: pd.DataFrame) -> pd.DataFrame:
         """Validate composite_cols and append one synthetic '|'-joined column per group.
 
@@ -1184,6 +1383,8 @@ class SupervisedTransformerMixin(sklearn.base.TransformerMixin):
             return X if (self.return_df or override_return_df) else X.to_numpy()
 
         self._apply_min_group_lumping(X)
+        # Opt-in: verify the mapping in use before encoding with it.
+        self._verify_mapping_manifest(X)
         X = self._transform(X, y)
         X = self._drop_composite_members(X)
 
@@ -1239,6 +1440,8 @@ class UnsupervisedTransformerMixin(sklearn.base.TransformerMixin):
             return X if (self.return_df or override_return_df) else X.to_numpy()
 
         self._apply_min_group_lumping(X)
+        # Opt-in: verify the mapping in use before encoding with it.
+        self._verify_mapping_manifest(X)
         X = self._transform(X)
         return self._drop_invariants(X, override_return_df)
 

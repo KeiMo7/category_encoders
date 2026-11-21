@@ -107,6 +107,9 @@ class WOEEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
         randomized=False,
         sigma=0.05,
         regularization=1.0,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
@@ -125,6 +128,9 @@ class WOEEncoder( util.SupervisedTransformerMixin,util.BaseEncoder):
             combine_min_nan_groups=combine_min_nan_groups,
             composite_cols=composite_cols,
             keep_components=keep_components,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.ordinal_encoder = None
         self._sum = None

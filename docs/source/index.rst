@@ -126,6 +126,7 @@ Contents:
    helmert
    jamesstein
    leaveoneout
+   mapping_integrity
    mestimate
    multihot
    onehot

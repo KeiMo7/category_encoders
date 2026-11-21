@@ -56,6 +56,9 @@ class BaseContrastEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         verbose=0,
         cols=None,
         mapping=None,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
         drop_invariant=False,
         return_df=True,
         handle_unknown='value',
@@ -74,6 +77,9 @@ class BaseContrastEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
             min_group_size=min_group_size,
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.mapping = mapping
         self.ordinal_encoder = None

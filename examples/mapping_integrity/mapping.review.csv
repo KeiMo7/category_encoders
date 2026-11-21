@@ -1,0 +1,10 @@
+column,category,category_type,encoded_value,encoded_type,sample_count
+city,chicago,str,1,int,2
+city,st louis,str,2,int,2
+city,detroit,str,3,int,1
+city,boston,str,4,int,1
+city,,missing,-2,int,
+tier,gold,str,1,int,2
+tier,silver,str,2,int,2
+tier,bronze,str,3,int,2
+tier,,missing,-2,int,

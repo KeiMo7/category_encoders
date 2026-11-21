@@ -118,6 +118,9 @@ class BaseNEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         drop_invariant=False,
         return_df=True,
         base=2,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
         handle_unknown='value',
         handle_missing='value',
         min_group_size: int | float | None = None,
@@ -134,6 +137,9 @@ class BaseNEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             min_group_size=min_group_size,
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.mapping = mapping
         self.ordinal_encoder = None

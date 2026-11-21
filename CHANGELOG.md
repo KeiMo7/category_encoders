@@ -1,3 +1,21 @@
+v.2.12.0 (unreleased)
+=====================
+
+* Feat: Added opt-in mapping integrity (``mapping_integrity=True``) to every
+  encoder that stores a fitted category mapping. Fit builds a versioned
+  ``mapping_manifest_`` (fit timestamp, sample count, category count, per-column
+  policies and a SHA-256 digest of the mapping content); transform verifies the
+  mapping in use against it and raises ``MappingMismatchError`` listing the
+  added/removed categories, changed codes and changed ``handle_unknown`` /
+  ``handle_missing`` policies, flagging a stale mapping when the training side
+  refit afterwards. ``MappingManifestNotFoundError`` and
+  ``MappingManifestCorruptionError`` (line, column and category range) replace
+  silent fallbacks, ``MappingDriftWarning`` reports large category drift, and
+  the manifest can be saved to a chunked JSON Lines file and exported to a
+  category / code / sample-count CSV for manual review. Default behaviour and
+  encoded values are unchanged when the switch is off. See
+  :doc:`mapping_integrity`.
+
 v.2.11.2
 ========
 

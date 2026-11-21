@@ -104,6 +104,9 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
         handle_missing: str = 'value',
         delimiter: str = '|',
         use_cat_names: bool = False,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
     ):
         super().__init__(
             verbose=verbose,
@@ -112,6 +115,9 @@ class MultiHotEncoder(util.UnsupervisedTransformerMixin, util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+        )
+        self._init_mapping_integrity(
+            mapping_integrity, mapping_manifest, mapping_drift_threshold
         )
         self.delimiter = delimiter
         self.use_cat_names = use_cat_names

@@ -61,6 +61,33 @@ class OrdinalEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         Set to 0 for zero-indexed labels, which can be convenient when feeding
         the encoded values into models that expect zero-indexed inputs such as
         embedding layers.
+    mapping_integrity: bool
+        if True, fit records a versioned manifest of the fitted category mapping
+        (``mapping_manifest_``: fit timestamp, sample count, category count,
+        per-column ``handle_unknown``/``handle_missing`` policies and a SHA-256
+        digest of the mapping content), and transform verifies the mapping in
+        use against it before encoding. A mismatch raises
+        ``MappingMismatchError`` naming added/removed categories, changed codes
+        and changed policies, and is flagged ``stale`` when the expected
+        manifest was fitted after the mapping in use. Default False, which
+        leaves fit/transform behavior and encoded values unchanged.
+    mapping_manifest: MappingManifest, path-like, reference encoder or None
+        expected training-side manifest to verify against at transform time.
+        Default None, which verifies against the encoder's own
+        ``mapping_manifest_``. A path is read with ``MappingManifest.load`` on
+        every verification, so a missing or damaged file is an error rather than
+        a silent fallback.
+    mapping_drift_threshold: float
+        fraction of inference categories unknown to the mapping (or fitted
+        categories absent from the inference data) above which transform emits
+        ``MappingDriftWarning``. Default 0.5. Only used with
+        ``mapping_integrity=True``.
+
+    Notes
+    -----
+    Mapping integrity is opt-in and additive: ``mapping`` and ``category_mapping``
+    keep their shapes and the encoded values do not change. See
+    :doc:`mapping_integrity`.
 
     Example
     -------
@@ -124,6 +151,9 @@ class OrdinalEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
+        mapping_integrity: bool = False,
+        mapping_manifest: object = None,
+        mapping_drift_threshold: float = 0.5,
     ):
         super().__init__(
             verbose=verbose,
@@ -136,7 +166,14 @@ class OrdinalEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
         )
+        self.mapping_integrity = mapping_integrity
+        self.mapping_manifest = mapping_manifest
+        self.mapping_drift_threshold = mapping_drift_threshold
         self.mapping_supplied = mapping is not None
+        self.mapping_manifest_ = None
+        self._resolved_mapping_manifest = None
+        self._mapping_manifest_path = None
+        self._mapping_manifest_signature = None
         if self.mapping_supplied:
             mapping = self._validate_supplied_mapping(mapping)
         self.mapping = mapping
