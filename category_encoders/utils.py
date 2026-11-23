@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass, fields
@@ -32,6 +33,87 @@ MISSING_SENTINEL = -2
 
 # Numeric types accepted for the handle_unknown/handle_missing strategies.
 NUMERIC_SCALARS = (int, float, np.integer, np.floating)
+
+# Composite keys: the separator between member values and the escape prefix that
+# keeps member values containing the separator unambiguous after joining.
+COMPOSITE_SEPARATOR = '|'
+COMPOSITE_ESCAPE_PREFIX = '\\'
+# Token collecting the keys merged by composite_overflow='lump'.
+COMPOSITE_LUMP_TOKEN = '__composite_lumped__'
+
+
+def escape_composite_member(value: str) -> str:
+    """Escape one member value so joined composite keys stay unambiguous.
+
+    The escape prefix and the separator are both prefixed with the escape
+    prefix, which makes the joined encoding injective: two distinct member
+    tuples can never produce the same composite key. Non-string values (NaN
+    survives astype(str) on pandas >= 3) pass through untouched; their rows
+    become missing composite keys downstream.
+    """
+    if not isinstance(value, str):
+        return value
+    return value.replace(COMPOSITE_ESCAPE_PREFIX, COMPOSITE_ESCAPE_PREFIX * 2).replace(
+        COMPOSITE_SEPARATOR, COMPOSITE_ESCAPE_PREFIX + COMPOSITE_SEPARATOR
+    )
+
+
+def composite_key_hash_prefix(value, length: int = 8) -> str:
+    """Stable short hash prefix of a composite key.
+
+    Used wherever a key would otherwise leak into column names, reports or
+    error messages: only the prefix is shown, never the full business key.
+    """
+    return hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:length]
+
+
+def composite_hash_token(value, buckets: int) -> str:
+    """Deterministic bucket token for composite_overflow='hash'."""
+    digest = hashlib.sha256(str(value).encode('utf-8')).digest()
+    return f'__composite_hash_{int.from_bytes(digest, "big") % buckets}__'
+
+
+def _distinct_raw_tuples(df: pd.DataFrame) -> set:
+    """Distinct row tuples of the raw (non-stringified) values.
+
+    Falls back to the stringified tuples when the raw values are unhashable.
+    """
+    try:
+        return set(map(tuple, df.to_numpy()))
+    except TypeError:
+        return set(map(tuple, df.astype(str).to_numpy()))
+
+
+def _composite_ambiguity_error(
+    X: pd.DataFrame, members: tuple[str, ...], name: str, joined: pd.Series, complete: pd.Series
+) -> ValueError:
+    """Build the ambiguity error, pointing at the conflicting members by hash prefix.
+
+    The raw business keys never appear in the message, only per-member hash
+    prefixes and row counts.
+    """
+    details = ''
+    try:
+        groups: dict = {}
+        for tup, joined_value in zip(
+            map(tuple, X[list(members)][complete].to_numpy()), joined[complete]
+        ):
+            groups.setdefault(joined_value, {}).setdefault(tup, 0)
+            groups[joined_value][tup] += 1
+        for tuples in groups.values():
+            if len(tuples) > 1:
+                parts = []
+                for tup, count in list(tuples.items())[:3]:
+                    hashes = ', '.join(composite_key_hash_prefix(v) for v in tup)
+                    parts.append(f'member hashes ({hashes}) in {count} row(s)')
+                details = ': ' + '; '.join(parts)
+                break
+    except TypeError:
+        details = ''
+    return ValueError(
+        f'Composite column {name!r} is ambiguous: distinct value combinations '
+        f'collide after joining{details}.'
+    )
 
 
 def convert_cols_to_list(
@@ -574,6 +656,8 @@ class BaseEncoder(BaseEstimator):
     min_group_lumping_: dict[str, dict]
     composite_cols: list[tuple[str, ...]] | None
     keep_components: bool
+    max_composite_cardinality: int | None
+    composite_overflow: str | None
     # fitted state: synthetic composite column name -> tuple of member columns
     composite_members_: dict[str, tuple[str, ...]] = {}
 
@@ -593,6 +677,14 @@ class BaseEncoder(BaseEstimator):
     # set this to False to opt out of the base-level lumping hooks.
     _min_group_hooks_enabled: bool = True
 
+    # Unsupervised encoders that accept composite_cols set this to True
+    # (CountEncoder, OneHotEncoder, HashingEncoder). Supervised encoders are
+    # allowed through their target tags instead.
+    _unsupervised_composite_cols: bool = False
+    # When True, member values are escape-encoded before joining so a separator
+    # inside a member value can never collapse two distinct combinations.
+    _composite_escape: bool = False
+
     def __init__(
         self,
         verbose: int = 0,
@@ -606,6 +698,8 @@ class BaseEncoder(BaseEstimator):
         combine_min_nan_groups: bool | str | None = None,
         composite_cols: list[tuple[str, ...]] | None = None,
         keep_components: bool = False,
+        max_composite_cardinality: int | None = None,
+        composite_overflow: str | None = None,
         **kwargs,
     ):
         """Initialize the encoder.
@@ -655,7 +749,8 @@ class BaseEncoder(BaseEstimator):
         composite_cols: list of tuples of str
             groups of columns to encode jointly, e.g. [('product', 'color')]. Each group
             becomes one synthetic column, named by joining the member names with '|',
-            which is encoded like any other column (supervised encoders only). Rows
+            which is encoded like any other column. Supported on supervised encoders
+            and on CountEncoder, OneHotEncoder and HashingEncoder. Rows
             where any member is missing get a missing composite value, so handle_missing
             applies as usual. The member columns themselves are dropped from the output
             unless keep_components is True. Default None (no composite columns).
@@ -663,6 +758,18 @@ class BaseEncoder(BaseEstimator):
             if True, the member columns of every composite group are also encoded
             individually and kept in the output next to the composite columns.
             Default False.
+        max_composite_cardinality: int, optional
+            maximum number of distinct composite keys per composite column. When the
+            fitted cardinality exceeds the budget, composite_overflow decides what
+            happens; without an overflow strategy the fit is rejected instead of
+            silently truncating. Default None (no budget).
+        composite_overflow: str, optional
+            how to merge composite keys that exceed max_composite_cardinality:
+            'lump' keeps the most frequent keys and folds the rest into one
+            leftovers key, 'hash' folds keys into max_composite_cardinality
+            deterministic hash buckets. Default None, which rejects the fit when
+            the budget is exceeded. The number of merged keys is reported in
+            the composite_report_ attribute.
         kwargs: dict.
             additional encoder specific parameters like regularisation.
         """
@@ -684,6 +791,8 @@ class BaseEncoder(BaseEstimator):
         self.combine_min_nan_groups = combine_min_nan_groups
         self.composite_cols = composite_cols
         self.keep_components = keep_components
+        self.max_composite_cardinality = max_composite_cardinality
+        self.composite_overflow = composite_overflow
         self._dim = None
 
     def fit(self, X: X_type, y: y_type | None = None, **kwargs):
@@ -972,19 +1081,26 @@ class BaseEncoder(BaseEstimator):
         Returns a new frame; the caller's X is never mutated.
         """
         self.composite_members_ = {}
+        self.composite_report_ = {}
+        self._composite_key_maps_ = {}
+        self._composite_fit_raw_keys_ = {}
+        self.unknown_composites_ = {}
         if not self.composite_cols:
             return X
 
-        if not self.__sklearn_tags__().target_tags.required:
+        if not (
+            self.__sklearn_tags__().target_tags.required or self._unsupervised_composite_cols
+        ):
             raise ValueError(
-                'composite_cols is only supported for supervised encoders, '
+                'composite_cols is only supported for supervised encoders and for '
+                'CountEncoder, OneHotEncoder and HashingEncoder, '
                 f'not {type(self).__name__}.'
             )
 
         composites: dict[str, pd.Series] = {}
         for group in self._validate_composite_cols(X):
-            name = '|'.join(group)
-            composites[name] = self._join_composite(X, group, name)
+            name = COMPOSITE_SEPARATOR.join(group)
+            composites[name] = self._join_composite(X, group, name, escape=self._composite_escape)
             self.composite_members_[name] = tuple(group)
 
         X = pd.concat([X, pd.DataFrame(composites, index=X.index)], axis=1)
@@ -996,6 +1112,13 @@ class BaseEncoder(BaseEstimator):
                 for member in group:
                     if member not in self.cols:
                         self.cols.append(member)
+        else:
+            # members are encoded only through the composite key; leaving them in
+            # cols would encode them individually and, for one-to-many encoders,
+            # leak member dummies into the output that cannot be dropped by name
+            member_set = {m for group in self.composite_members_.values() for m in group}
+            self.cols = [col for col in self.cols if col not in member_set]
+        self._fit_composite_budget(X)
         return X
 
     def _validate_composite_cols(self, X: pd.DataFrame) -> list[tuple[str, ...]]:
@@ -1011,13 +1134,13 @@ class BaseEncoder(BaseEstimator):
             if (
                 not isinstance(group, tuple)
                 or len(group) < 2
-                or not all(isinstance(member, str) for member in group)
+                or not all(isinstance(member, str) and member for member in group)
             ):
                 raise ValueError(
-                    'Each composite group must be a tuple of at least two column names, '
-                    f"e.g. ('product', 'color'), got {group!r}."
+                    'Each composite group must be a tuple of at least two non-empty '
+                    f"column names, e.g. ('product', 'color'), got {group!r}."
                 )
-            name = '|'.join(group)
+            name = COMPOSITE_SEPARATOR.join(group)
             missing = [member for member in group if member not in X.columns]
             if missing:
                 raise ValueError(f'composite_cols references missing columns: {missing}')
@@ -1030,35 +1153,162 @@ class BaseEncoder(BaseEstimator):
         return groups
 
     @staticmethod
-    def _join_composite(X: pd.DataFrame, members: tuple[str, ...], name: str) -> pd.Series:
+    def _join_composite(
+        X: pd.DataFrame, members: tuple[str, ...], name: str, escape: bool = False
+    ) -> pd.Series:
         """Join the member columns of one composite group into a single column.
 
-        Distinct member combinations must stay distinct after joining. Rows where any
-        member is missing become missing so the regular handle_missing machinery
-        applies to composites unchanged.
+        Distinct member combinations must stay distinct after joining. With
+        escape=True the separator and the escape prefix are escape-encoded in
+        every member value first, so member values containing the separator
+        cannot collide. Rows where any member is missing become missing so the
+        regular handle_missing machinery applies to composites unchanged.
         """
         missing = X[list(members)].isna().any(axis=1)
         parts = X[list(members)].astype(str)
+        if escape:
+            parts = parts.apply(lambda col: col.map(escape_composite_member))
         joined = parts[members[0]]
         for member in members[1:]:
-            joined = joined + '|' + parts[member]
+            joined = joined + COMPOSITE_SEPARATOR + parts[member]
         # Rows with a missing member become missing anyway, and pandas >= 3 keeps them
         # as NaN through astype(str), so only complete rows can collide.
         complete = ~missing
-        if len(set(joined[complete])) < len(set(map(tuple, parts[complete].to_numpy()))):
-            raise ValueError(
-                f'Composite column {name!r} is ambiguous: the "|" separator occurs in '
-                'the data, so distinct value combinations collide after joining.'
-            )
+        if escape:
+            # The escaped join is injective on the stringified parts; what it cannot
+            # distinguish are raw values that stringify identically (e.g. 1 and '1').
+            distinct = _distinct_raw_tuples(X[list(members)][complete])
+        else:
+            distinct = set(map(tuple, parts[complete].to_numpy()))
+        if len(set(joined[complete])) < len(distinct):
+            raise _composite_ambiguity_error(X, members, name, joined, complete)
         joined[missing] = np.nan
         return joined
+
+    def _fit_composite_budget(self, X: pd.DataFrame) -> None:
+        """Learn the per-composite key statistics and enforce the cardinality budget.
+
+        Unsupervised: only X is read, never the target. Fills composite_report_
+        and, when composite_overflow is configured, the key-merge maps applied
+        identically at fit and transform time.
+        """
+        if self.composite_overflow not in (None, 'lump', 'hash'):
+            raise ValueError(
+                "composite_overflow must be one of None, 'lump' or 'hash', "
+                f'got {self.composite_overflow!r}.'
+            )
+        if self.max_composite_cardinality is not None and (
+            not isinstance(self.max_composite_cardinality, (int, np.integer))
+            or self.max_composite_cardinality < 2
+        ):
+            raise ValueError(
+                'max_composite_cardinality must be an integer >= 2, '
+                f'got {self.max_composite_cardinality!r}.'
+            )
+        for name in self.composite_members_:
+            series = X[name]
+            counts = series.dropna().value_counts()
+            cardinality = int(len(counts))
+            self._composite_fit_raw_keys_[name] = set(counts.index)
+            report = {
+                'members': self.composite_members_[name],
+                'cardinality': cardinality,
+                'missing_rows': int(series.isna().sum()),
+                'max_cardinality': self.max_composite_cardinality,
+                'overflow_strategy': None,
+                'merged_keys': 0,
+                'kept_keys': cardinality,
+                'unknown_keys': 0,
+            }
+            limit = self.max_composite_cardinality
+            if limit is not None and cardinality > limit:
+                if self.composite_overflow is None:
+                    raise ValueError(
+                        f'Composite column {name!r} has {cardinality} distinct keys, '
+                        f'exceeding max_composite_cardinality={limit}. Set '
+                        "composite_overflow to 'lump' or 'hash' to merge within the "
+                        'budget, or raise the budget.'
+                    )
+                report['overflow_strategy'] = self.composite_overflow
+                if self.composite_overflow == 'lump':
+                    key_map = self._build_lump_key_map(counts, limit, name)
+                    # merged keys fold into one shared leftovers token
+                    merged = len(key_map)
+                    kept = cardinality - merged + 1
+                else:
+                    key_map = self._build_hash_key_map(counts, limit, name)
+                    # merged keys share a hash bucket with at least one other key
+                    kept = len(set(key_map.values()))
+                    merged = cardinality - kept
+                self._composite_key_maps_[name] = key_map
+                report['merged_keys'] = int(merged)
+                report['kept_keys'] = int(kept)
+                X[name] = series.map(lambda v: key_map.get(v, v) if pd.notna(v) else v)
+            self.composite_report_[name] = report
+
+    @staticmethod
+    def _build_lump_key_map(
+        counts: pd.Series, limit: int, name: str
+    ) -> dict:
+        """Map all but the (limit - 1) most frequent keys to the leftovers token."""
+        if COMPOSITE_LUMP_TOKEN in counts.index:
+            raise ValueError(
+                f'Composite column {name!r} contains the reserved leftovers token; '
+                'cannot apply lump overflow.'
+            )
+        # deterministic: frequency first, then the key itself for ties
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        return {key: COMPOSITE_LUMP_TOKEN for key, _ in ordered[limit - 1 :]}
+
+    @staticmethod
+    def _build_hash_key_map(counts: pd.Series, limit: int, name: str) -> dict:
+        """Map every key to one of `limit` deterministic hash bucket tokens."""
+        key_map = {key: composite_hash_token(key, limit) for key in counts.index}
+        tokens = set(key_map.values())
+        collision = tokens & set(counts.index)
+        if collision:
+            raise ValueError(
+                f'Composite column {name!r} contains values colliding with the '
+                'reserved hash bucket tokens; cannot apply hash overflow.'
+            )
+        return key_map
+
+    def _track_unknown_composites(self, X: pd.DataFrame) -> None:
+        """Record composite keys unseen at fit as hash prefixes with counts.
+
+        Only the hash prefix and the row count are kept, never the raw key, so
+        unknown combinations stay traceable without leaking business keys.
+        """
+        for name in self.composite_members_:
+            values = X[name]
+            mask = values.notna() & ~values.isin(self._composite_fit_raw_keys_[name])
+            if not mask.any():
+                continue
+            store = self.unknown_composites_.setdefault(name, {})
+            for key, count in values[mask].value_counts().items():
+                prefix = composite_key_hash_prefix(key)
+                store[prefix] = store.get(prefix, 0) + int(count)
+            self.composite_report_[name]['unknown_keys'] = len(store)
+
+    def _apply_composite_budget(self, X: pd.DataFrame) -> None:
+        """Fold fitted overflow key maps into the composite columns, in place.
+
+        Keys unseen at fit pass through unchanged so the encoder's regular
+        handle_unknown strategy applies to them.
+        """
+        for name, key_map in self._composite_key_maps_.items():
+            if not key_map:
+                continue
+            mapped = X[name].map(key_map)
+            X[name] = mapped.where(mapped.notna(), X[name])
 
     def _add_composite_columns(self, X: pd.DataFrame) -> pd.DataFrame:
         """Rebuild the synthetic composite columns on the transform input.
 
-        Synthetic columns are always derived from the member columns, so transform
-        cannot drift from fit; a frame that already carries them (the fit-time frame)
-        gets them rebuilt in place at the end of the column list.
+        Synthetic columns are always derived from the member columns with the
+        same _join_composite used at fit, so transform cannot drift from fit;
+        a frame that already carries them (the fit-time frame) gets them rebuilt
+        in place at the end of the column list.
         """
         if not self.composite_members_:
             return X
@@ -1070,11 +1320,14 @@ class BaseEncoder(BaseEstimator):
                 f'{missing_inputs}'
             )
         composites = {
-            name: self._join_composite(X, group, name)
+            name: self._join_composite(X, group, name, escape=self._composite_escape)
             for name, group in self.composite_members_.items()
         }
         X = X.drop(columns=[name for name in composites if name in X.columns])
-        return pd.concat([X, pd.DataFrame(composites, index=X.index)], axis=1)
+        X = pd.concat([X, pd.DataFrame(composites, index=X.index)], axis=1)
+        self._track_unknown_composites(X)
+        self._apply_composite_budget(X)
+        return X
 
     def _drop_composite_members(self, df: pd.DataFrame) -> pd.DataFrame:
         """Drop composite member columns from the output unless keep_components."""
@@ -1233,6 +1486,7 @@ class UnsupervisedTransformerMixin(sklearn.base.TransformerMixin):
         X = convert_input(X, columns=columns, deep=True)
         if columns is not None:
             X = self._restore_fitted_dtypes(X)
+        X = self._add_composite_columns(X)
         self._check_transform_inputs(X)
 
         if not list(self.cols):
@@ -1240,6 +1494,7 @@ class UnsupervisedTransformerMixin(sklearn.base.TransformerMixin):
 
         self._apply_min_group_lumping(X)
         X = self._transform(X)
+        X = self._drop_composite_members(X)
         return self._drop_invariants(X, override_return_df)
 
     @abstractmethod

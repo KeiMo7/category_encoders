@@ -1,0 +1,6 @@
+product,color,naive_join,composite_key,naive_collides
+a|b,c,a|b|c,a\|b|c,True
+a,b|c,a|b|c,a|b\|c,True
+a|b,c,a|b|c,a\|b|c,True
+x,r,x|r,x|r,False
+back\,slash,back\|slash,back\\|slash,False

@@ -69,6 +69,22 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         for more details and tradeoffs. Defaults to "fork" on linux/macos as it
         is the fastest option and to "spawn" on windows as it is the only one
         available
+    composite_cols: list of tuples of str, optional
+        groups of columns to hash jointly, e.g. [('product', 'color')]. Each
+        group becomes one composite key column whose joined value is hashed as
+        a single value. Member values are escape-encoded before joining, so a
+        '|' inside a value can never collapse two distinct combinations. Bucket
+        collisions over the fitted keys are counted in composite_report_.
+    keep_components: bool
+        if True, the member columns of every composite group are kept in the
+        output. Default False.
+    max_composite_cardinality: int, optional
+        maximum number of distinct composite keys per composite column. When
+        the budget is exceeded, composite_overflow merges keys ('lump' or
+        'hash'); without a strategy the fit is rejected. The merged key count
+        is reported in composite_report_.
+    composite_overflow: str, optional
+        'lump' or 'hash', see max_composite_cardinality.
 
     Example
     -------
@@ -126,6 +142,11 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
     _VALID_HANDLE_MISSING = None
     _VALID_HANDLE_UNKNOWN = None
 
+    # Composite keys are hashed like any other value; the fit-time report makes
+    # bucket collisions over the fitted keys observable.
+    _unsupervised_composite_cols = True
+    _composite_escape = True
+
     def __init__(
         self,
         max_process=0,
@@ -140,6 +161,10 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
+        composite_cols: list[tuple[str, ...]] | None = None,
+        keep_components: bool = False,
+        max_composite_cardinality: int | None = None,
+        composite_overflow: str | None = None,
     ):
         super().__init__(
             verbose=verbose,
@@ -151,6 +176,10 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             min_group_size=min_group_size,
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
+            composite_cols=composite_cols,
+            keep_components=keep_components,
+            max_composite_cardinality=max_composite_cardinality,
+            composite_overflow=composite_overflow,
         )
 
         if max_process not in range(1, 128):
@@ -176,7 +205,22 @@ class HashingEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         self.hash_method = hash_method
 
     def _fit(self, X, y=None, **kwargs):
-        pass
+        """Measure hash-bucket collisions over the fitted composite keys.
+
+        Unsupervised: only the composite key column is read, never the target.
+        The report stores counts only, never the keys themselves.
+        """
+        for name in self.composite_members_:
+            keys = X[name].dropna().unique()
+            hasher_constructor = getattr(hashlib, self.hash_method)
+            buckets = set()
+            for key in keys:
+                hasher = hasher_constructor()
+                hasher.update(bytes(str(key), 'utf-8'))
+                buckets.add(int.from_bytes(hasher.digest(), byteorder='big') % self.n_components)
+            report = self.composite_report_[name]
+            report['hash_buckets_used'] = len(buckets)
+            report['hash_collisions'] = int(len(keys) - len(buckets))
 
     def _transform(self, X, override_return_df=False):
         """Perform the transformation to new categorical data.

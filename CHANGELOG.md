@@ -1,3 +1,21 @@
+Unreleased
+==========
+
+* Feature: ``composite_cols`` is now supported on ``CountEncoder``,
+  ``OneHotEncoder`` and ``HashingEncoder``, so multi-column combination keys
+  are a formal input of the frequency, one-hot and hashing paths instead of a
+  manually concatenated string. On these encoders member values are
+  escape-encoded before joining, so a ``|`` inside a member value can never
+  collapse two distinct combinations; supervised encoders keep their existing
+  join behavior. New ``max_composite_cardinality`` / ``composite_overflow``
+  parameters bound the composite cardinality: exceeding the budget without an
+  overflow strategy raises, ``'lump'`` folds low-frequency keys into one
+  leftovers key and ``'hash'`` folds keys into deterministic hash buckets, with
+  the merged key count reported in the new ``composite_report_`` attribute.
+  Combinations unseen at transform time are recorded as hash prefixes with
+  counts in ``unknown_composites_``; full business keys never appear in output
+  column names, reports or error messages.
+
 v.2.11.2
 ========
 

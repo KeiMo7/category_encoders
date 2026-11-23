@@ -26,6 +26,10 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
     # threshold tied to `normalize`); it opts out of the base-level lumping hooks.
     _min_group_hooks_enabled = False
 
+    # Count/frequency statistics over composite keys stay unsupervised.
+    _unsupervised_composite_cols = True
+    _composite_escape = True
+
     def __init__(
         self,
         verbose=0,
@@ -38,6 +42,10 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         combine_min_nan_groups=None,
         min_group_name=None,
         normalize=False,
+        composite_cols=None,
+        keep_components=False,
+        max_composite_cardinality=None,
+        composite_overflow=None,
     ):
         """Count encoding for categorical features.
 
@@ -85,6 +93,22 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             also be forced to combine with 'force' meaning small groups are effectively
             counted as nans. Force can only be used when 'handle_missing' is 'value' or 'error'.
             Note: Will not force if it creates a binary or invariant column.
+        composite_cols: list of tuples of str, optional
+            groups of columns to count jointly, e.g. [('product', 'color')]. Each
+            group becomes one composite key column, counted as a whole instead of
+            per member column. Member values are escape-encoded before joining, so
+            a '|' inside a value can never collapse two distinct combinations.
+            Rows with any missing member count as a missing composite key.
+        keep_components: bool
+            if True, the member columns of every composite group are also encoded
+            individually and kept in the output. Default False.
+        max_composite_cardinality: int, optional
+            maximum number of distinct composite keys per composite column.
+            Exceeding the budget without a composite_overflow strategy raises.
+        composite_overflow: str, optional
+            'lump' folds all but the most frequent keys into one leftovers key,
+            'hash' folds keys into max_composite_cardinality deterministic hash
+            buckets. The number of merged keys is reported in composite_report_.
 
 
         Example
@@ -131,6 +155,10 @@ class CountEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             return_df=return_df,
             handle_unknown=handle_unknown,
             handle_missing=handle_missing,
+            composite_cols=composite_cols,
+            keep_components=keep_components,
+            max_composite_cardinality=max_composite_cardinality,
+            composite_overflow=composite_overflow,
         )
         self.mapping = None
         self.normalize = normalize

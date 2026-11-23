@@ -1,0 +1,5 @@
+pytest tests/test_count.py tests/test_one_hot.py tests/test_hashing.py tests/test_composite_cols.py tests/test_composite_unsupervised.py
+exit code: 0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+83 passed, 664 warnings, 19 subtests passed in 3.19s

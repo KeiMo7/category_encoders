@@ -50,6 +50,25 @@ class OneHotEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         (whether there are missing values in the training set or not).
         'ignore' will encode missing values as 0 in every dummy column,
         NOT adding an additional category.
+    composite_cols: list of tuples of str, optional
+        groups of columns to expand jointly, e.g. [('product', 'color')]. Each
+        group becomes one composite key column whose combinations are dummied.
+        Member values are escape-encoded before joining, so a '|' inside a
+        value can never collapse two distinct combinations. With use_cat_names,
+        composite dummy columns carry only a hash prefix of the key, never the
+        full key value.
+    keep_components: bool
+        if True, the member columns of every composite group are also encoded
+        individually and kept in the output. Default False.
+    max_composite_cardinality: int, optional
+        maximum number of distinct composite keys per composite column. When
+        the budget is exceeded, composite_overflow merges keys: 'lump' folds
+        low-frequency keys into one leftovers key, 'hash' folds keys into
+        max_composite_cardinality deterministic hash buckets. Without a
+        strategy the fit is rejected. The merged key count is reported in
+        composite_report_.
+    composite_overflow: str, optional
+        'lump' or 'hash', see max_composite_cardinality.
 
 
     Example
@@ -112,6 +131,10 @@ class OneHotEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
     _VALID_HANDLE_MISSING = ('error', 'return_nan', 'value', 'ignore', 'indicator')
     _VALID_HANDLE_UNKNOWN = ('error', 'return_nan', 'value', 'indicator')
 
+    # Composite keys expand into dummies like any other column, unsupervised.
+    _unsupervised_composite_cols = True
+    _composite_escape = True
+
     def __init__(
         self,
         verbose: int = 0,
@@ -124,6 +147,10 @@ class OneHotEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
         min_group_size: int | float | None = None,
         min_group_name: str | None = None,
         combine_min_nan_groups: bool | str | None = None,
+        composite_cols: list[tuple[str, ...]] | None = None,
+        keep_components: bool = False,
+        max_composite_cardinality: int | None = None,
+        composite_overflow: str | None = None,
     ):
         super().__init__(
             verbose=verbose,
@@ -135,6 +162,10 @@ class OneHotEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
             min_group_size=min_group_size,
             min_group_name=min_group_name,
             combine_min_nan_groups=combine_min_nan_groups,
+            composite_cols=composite_cols,
+            keep_components=keep_components,
+            max_composite_cardinality=max_composite_cardinality,
+            composite_overflow=composite_overflow,
         )
         self.mapping: list[dict[str, pd.DataFrame]] | None = None
         self.ordinal_encoder = None
@@ -194,7 +225,12 @@ class OneHotEncoder( util.UnsupervisedTransformerMixin,util.BaseEncoder):
                     append_nan_to_index = class_
                     continue
                 if self.use_cat_names:
-                    n_col_name = f'{col}_{cat_name}'
+                    cat_label = cat_name
+                    if col in self.composite_members_ and not pd.isna(cat_name):
+                        # composite keys are business keys: only their hash prefix
+                        # may appear in output column names, never the full key
+                        cat_label = f'k{util.composite_key_hash_prefix(cat_name)}'
+                    n_col_name = f'{col}_{cat_label}'
                     found_count = found_column_counts.get(n_col_name, 0)
                     found_column_counts[n_col_name] = found_count + 1
                     n_col_name += '#' * found_count

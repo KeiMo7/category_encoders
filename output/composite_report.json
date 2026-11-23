@@ -1,0 +1,64 @@
+{
+  "count_separator_data": {
+    "product|color": {
+      "members": [
+        "product",
+        "color"
+      ],
+      "cardinality": 4,
+      "missing_rows": 0,
+      "max_cardinality": null,
+      "overflow_strategy": null,
+      "merged_keys": 0,
+      "kept_keys": 4,
+      "unknown_keys": 0
+    }
+  },
+  "onehot_separator_data": {
+    "product|color": {
+      "members": [
+        "product",
+        "color"
+      ],
+      "cardinality": 4,
+      "missing_rows": 0,
+      "max_cardinality": null,
+      "overflow_strategy": null,
+      "merged_keys": 0,
+      "kept_keys": 4,
+      "unknown_keys": 0
+    }
+  },
+  "hashing_separator_data": {
+    "product|color": {
+      "members": [
+        "product",
+        "color"
+      ],
+      "cardinality": 4,
+      "missing_rows": 0,
+      "max_cardinality": null,
+      "overflow_strategy": null,
+      "merged_keys": 0,
+      "kept_keys": 4,
+      "unknown_keys": 0,
+      "hash_buckets_used": 4,
+      "hash_collisions": 0
+    }
+  },
+  "count_lump_budget_4": {
+    "product|color": {
+      "members": [
+        "product",
+        "color"
+      ],
+      "cardinality": 12,
+      "missing_rows": 0,
+      "max_cardinality": 4,
+      "overflow_strategy": "lump",
+      "merged_keys": 9,
+      "kept_keys": 4,
+      "unknown_keys": 0
+    }
+  }
+}
